@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, Pressable, Animated, Dimensions } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Animated, Dimensions, TextInput } from 'react-native';
+import * as Haptics from 'expo-haptics';
 import { Eye, Heart, Skull, Play, RotateCcw } from 'lucide-react-native';
-import { saveScore } from '@/lib/storage';
+import { saveScore, getPlayerName as loadPlayerName, setPlayerName as persistPlayerName, syncPendingScores } from '@/lib/storage';
 
 const { width, height } = Dimensions.get('window');
 
@@ -13,6 +14,13 @@ type Ghost = {
   speed: number;
 };
 
+type Knife = {
+  id: number;
+  x: Animated.Value;
+  y: Animated.Value;
+  rotationDeg: string; // for transform rotate
+};
+
 export default function GameScreen() {
   const [gameState, setGameState] = useState<'menu' | 'playing' | 'gameOver'>('menu');
   const [lives, setLives] = useState(3);
@@ -22,8 +30,10 @@ export default function GameScreen() {
   const [isBlinking, setIsBlinking] = useState(false);
 
   const blinkOpacity = useRef(new Animated.Value(1)).current;
-  const gameLoopRef = useRef<NodeJS.Timeout | null>(null);
+  const gameLoopRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const ghostIdCounter = useRef(0);
+  const knifeIdCounter = useRef(0);
+  const [knives, setKnives] = useState<Knife[]>([]);
 
   const startGame = () => {
     setGameState('playing');
@@ -31,6 +41,8 @@ export default function GameScreen() {
     setScore(0);
     setGhosts([]);
     ghostIdCounter.current = 0;
+    setStartTime(Date.now());
+    setDifficultyMultiplier(1);
   };
 
   const endGame = async () => {
@@ -62,12 +74,14 @@ export default function GameScreen() {
       y = height + 50;
     }
 
+    const baseSpeed = 1 + Math.random() * 2;
     const newGhost: Ghost = {
       id: ghostIdCounter.current++,
       x,
       y,
       opacity: new Animated.Value(0),
-      speed: 1 + Math.random() * 2,
+      // new ghosts inherit current difficulty and cumulative speed boost
+      speed: baseSpeed * difficultyMultiplier * speedBoost,
     };
 
     Animated.timing(newGhost.opacity, {
@@ -79,10 +93,39 @@ export default function GameScreen() {
     setGhosts(prev => [...prev, newGhost]);
   };
 
-  const tapGhost = (ghostId: number) => {
-    setGhosts(prev => prev.filter(g => g.id !== ghostId));
+  const tapGhost = (ghost: Ghost) => {
+    // remove the tapped ghost
+    setGhosts(prev => prev.filter(g => g.id !== ghost.id));
     setScore(prev => prev + 10);
-    triggerBlink();
+    // increase global speed boost slightly each time player scores
+    setSpeedBoost(prev => {
+      const next = Number((prev + 0.02).toFixed(3));
+      return next;
+    });
+    // immediately nudge existing ghosts to be a bit faster
+    setGhosts(prev => prev.map(g => ({ ...g, speed: g.speed * 1.02 })));
+
+    // throw a knife from center to the ghost position
+    const cx = width / 2;
+    const cy = height / 2;
+    const kx = new Animated.Value(cx);
+    const ky = new Animated.Value(cy);
+    const angleRad = Math.atan2(ghost.y - cy, ghost.x - cx);
+    const rotationDeg = `${(angleRad * 180) / Math.PI}deg`;
+    const id = knifeIdCounter.current++;
+    const knife: Knife = { id, x: kx, y: ky, rotationDeg };
+    setKnives(prev => [...prev, knife]);
+
+    Animated.parallel([
+      Animated.timing(kx, { toValue: ghost.x, duration: 250, useNativeDriver: false }),
+      Animated.timing(ky, { toValue: ghost.y, duration: 250, useNativeDriver: false }),
+    ]).start(() => {
+      // remove the knife after it reaches the target
+      setKnives(prev => prev.filter(k => k.id !== id));
+    });
+
+    // small haptic feedback on hit
+    try { Haptics.selectionAsync(); } catch {}
   };
 
   const triggerBlink = () => {
@@ -102,12 +145,37 @@ export default function GameScreen() {
   };
 
   useEffect(() => {
+    // preload saved player name and attempt sync of pending scores
+    loadPlayerName().then(name => setPlayerName(name));
+    syncPendingScores().catch(() => {});
+  }, []);
+
+  // difficulty ramp
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [difficultyMultiplier, setDifficultyMultiplier] = useState(1);
+  // cumulative speed boost that increases every time player scores
+  const [speedBoost, setSpeedBoost] = useState(1);
+
+  useEffect(() => {
+    if (gameState !== 'playing' || startTime == null) return;
+    const id = setInterval(() => {
+      const elapsed = (Date.now() - startTime) / 1000; // seconds
+      // increase multiplier slowly over time (caps at 3x)
+      const mult = Math.min(1 + elapsed * 0.02, 3);
+      setDifficultyMultiplier(mult);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [gameState, startTime]);
+
+  useEffect(() => {
     if (gameState === 'playing') {
       const spawnInterval = setInterval(() => {
-        if (Math.random() < 0.3) {
+        const baseChance = 0.6;
+        const spawnChance = Math.min(baseChance + 0.1 * (difficultyMultiplier - 1), 0.95);
+        if (Math.random() < spawnChance) {
           spawnGhost();
         }
-      }, 1000);
+      }, Math.max(250, 600 - (difficultyMultiplier - 1) * 150));
 
       gameLoopRef.current = setInterval(() => {
         setGhosts(prev => {
@@ -119,6 +187,8 @@ export default function GameScreen() {
             if (distance < 50) {
               setLives(current => {
                 const newLives = current - 1;
+                // haptic on life lost
+                try { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
                 if (newLives <= 0) {
                   setTimeout(() => endGame(), 100);
                 }
@@ -127,10 +197,12 @@ export default function GameScreen() {
               return null;
             }
 
+            // guard against extremely small distances
+            const safeDistance = distance || 1;
             return {
               ...ghost,
-              x: ghost.x + (dx / distance) * ghost.speed,
-              y: ghost.y + (dy / distance) * ghost.speed,
+              x: ghost.x + (dx / safeDistance) * ghost.speed,
+              y: ghost.y + (dy / safeDistance) * ghost.speed,
             };
           }).filter(Boolean) as Ghost[];
 
@@ -154,6 +226,17 @@ export default function GameScreen() {
           <Skull size={80} color="#ff0000" />
           <Text style={styles.title}>THE HAUNTING</Text>
           <Text style={styles.subtitle}>Survive the ghosts...</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Your name"
+            placeholderTextColor="#777"
+            value={playerName}
+            onChangeText={(t) => setPlayerName(t)}
+            onBlur={() => persistPlayerName(playerName)}
+            returnKeyType="done"
+            maxLength={20}
+            autoCorrect={false}
+          />
           <Pressable style={styles.button} onPress={startGame}>
             <Play size={24} color="#fff" />
             <Text style={styles.buttonText}>START GAME</Text>
@@ -184,7 +267,7 @@ export default function GameScreen() {
   }
 
   return (
-    <Animated.View style={[styles.gameContainer, { opacity: blinkOpacity }]}>
+    <View style={styles.gameContainer}>
       <View style={styles.hud}>
         <View style={styles.livesContainer}>
           {[...Array(lives)].map((_, i) => (
@@ -198,6 +281,29 @@ export default function GameScreen() {
         <Eye size={40} color="#ff0000" />
       </View>
 
+      {/* Static knives around the player */}
+      {[0, 90, 180, 270].map((deg, idx) => {
+        const r = 50;
+        const rad = (deg * Math.PI) / 180;
+        const cx = width / 2;
+        const cy = height / 2;
+        const kx = cx + r * Math.cos(rad);
+        const ky = cy + r * Math.sin(rad);
+        return (
+          <View
+            key={`static-knife-${idx}`}
+            style={[
+              styles.knife,
+              {
+                left: kx - 15,
+                top: ky - 3,
+                transform: [{ rotate: `${deg}deg` }],
+              },
+            ]}
+          />
+        );
+      })}
+
       {ghosts.map(ghost => (
         <Animated.View
           key={ghost.id}
@@ -209,12 +315,27 @@ export default function GameScreen() {
               opacity: ghost.opacity,
             },
           ]}>
-          <Pressable onPress={() => tapGhost(ghost.id)}>
+          <Pressable onPress={() => tapGhost(ghost)}>
             <Skull size={50} color="#00ff00" />
           </Pressable>
         </Animated.View>
       ))}
-    </Animated.View>
+
+      {/* Knife projectiles */}
+      {knives.map(k => (
+        <Animated.View
+          key={k.id}
+          style={[
+            styles.knife,
+            {
+              left: Animated.add(k.x, new Animated.Value(-15)),
+              top: Animated.add(k.y, new Animated.Value(-3)),
+              transform: [{ rotate: k.rotationDeg }],
+            },
+          ]}
+        />
+      ))}
+    </View>
   );
 }
 
@@ -243,6 +364,17 @@ const styles = StyleSheet.create({
     fontSize: 18,
     color: '#999',
     marginBottom: 40,
+  },
+  input: {
+    width: 260,
+    backgroundColor: '#1a1a1a',
+    color: '#fff',
+    borderWidth: 1,
+    borderColor: '#330000',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 16,
   },
   button: {
     flexDirection: 'row',
@@ -310,5 +442,15 @@ const styles = StyleSheet.create({
   ghost: {
     position: 'absolute',
     zIndex: 10,
+  },
+  knife: {
+    position: 'absolute',
+    width: 30,
+    height: 6,
+    backgroundColor: '#cccccc',
+    borderRadius: 3,
+    zIndex: 20,
+    borderWidth: 1,
+    borderColor: '#aaaaaa',
   },
 });
